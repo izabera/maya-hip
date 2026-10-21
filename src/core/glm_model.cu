@@ -1447,6 +1447,72 @@ static double host_read_bps() {
     return sink.load() == 1 ? best + 1.0 : best;   // (the sum keeps the reads)
 }
 
+// one pass of device_read_bps: the buffer read end to end, each thread over its grid-stride share with four 16-byte
+// loads in flight; the sum only decides a store that never comes (the buffer is zeros), so the loads stay
+static __global__ void device_read_pass(const uint4* __restrict__ p, size_t n, unsigned* __restrict__ sink) {
+    const size_t stride = (size_t) gridDim.x * blockDim.x;
+    size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned acc = 0;
+    for (; i + 3 * stride < n; i += 4 * stride) {
+        const uint4 a = p[i], b = p[i + stride], c = p[i + 2 * stride], d = p[i + 3 * stride];
+        acc ^= (a.x ^ a.y ^ a.z ^ a.w) ^ (b.x ^ b.y ^ b.z ^ b.w) ^ (c.x ^ c.y ^ c.z ^ c.w) ^ (d.x ^ d.y ^ d.z ^ d.w);
+    }
+    for (; i < n; i += stride) {
+        const uint4 a = p[i];
+        acc ^= a.x ^ a.y ^ a.z ^ a.w;
+    }
+    if (acc == 0x9e3779b9u) *sink = acc;
+}
+
+// a card's memory read speed (bytes/s), measured as the host's is: a 1 GiB buffer (past every card's last-level cache;
+// a quarter of the free VRAM at most) read end to end for ~0.4 s, the fastest pass taken (the first ones run while the
+// memory clock ramps up from idle); 0 when it cannot be measured.  The clock attributes do not give it portably:
+// CUDA's memory clock is half the data rate a pin (so 2 x clock x bus width), HIP's is the clock the driver runs -
+// 1/16 of the data rate on a GDDR6 Radeon (an RX 7900 XTX reads 1250 MHz for its 20 Gbps: 120 GB/s of its 960), but
+// not on HBM parts
+static double device_read_bps(int dev, double free_bytes) {
+    const size_t bytes = std::min<size_t>((size_t) 1 << 30, (size_t) (free_bytes / 4.0)) & ~(((size_t) 1 << 20) - 1);
+    if (bytes < ((size_t) 256 << 20) || cudaSetDevice(dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0.0;
+    }
+    int sms = 0;
+    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || sms <= 0) sms = 64;
+    void* buf = nullptr;
+    unsigned* sink = nullptr;
+    cudaStream_t s = nullptr;
+    cudaEvent_t e0 = nullptr, e1 = nullptr;
+    double best = 0.0;
+    if (cudaMalloc(&buf, bytes) == cudaSuccess && cudaMalloc((void**) &sink, sizeof(unsigned)) == cudaSuccess &&
+        cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess && cudaEventCreate(&e0) == cudaSuccess &&
+        cudaEventCreate(&e1) == cudaSuccess && cudaMemsetAsync(buf, 0, bytes, s) == cudaSuccess) {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int rep = 0; rep < 2000; ++rep) {
+            float ms = 0.0f;
+            bool ok = cudaEventRecord(e0, s) == cudaSuccess;
+            device_read_pass<<<sms * 8, 256, 0, s>>>((const uint4*) buf, bytes / sizeof(uint4), sink);
+            ok = ok && cudaGetLastError() == cudaSuccess && cudaEventRecord(e1, s) == cudaSuccess &&
+                 cudaEventSynchronize(e1) == cudaSuccess && cudaEventElapsedTime(&ms, e0, e1) == cudaSuccess;
+            if (!ok) {
+                best = 0.0;
+                break;
+            }
+            if (ms > 0.0f) best = std::max(best, (double) bytes / (1e-3 * (double) ms));
+            if (rep >= 8 && std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(400)) break;
+        }
+    }
+    if (s != nullptr) {
+        (void) cudaStreamSynchronize(s);
+        (void) cudaStreamDestroy(s);
+    }
+    if (e0 != nullptr) (void) cudaEventDestroy(e0);
+    if (e1 != nullptr) (void) cudaEventDestroy(e1);
+    if (sink != nullptr) (void) cudaFree(sink);
+    if (buf != nullptr) (void) cudaFree(buf);
+    (void) cudaGetLastError();
+    return best < 1e14 ? best : 0.0;   // (a pass that never ran reads as an impossible speed)
+}
+
 // ---------------------------------------------------------------- --layer-split auto: Strata's split search
 // Every placement of the layers on the GPUs is priced by the decode time it predicts, and the cheapest one that can
 // start is taken - Strata's `--layer-split auto` (src/program/generate.cpp), with this engine's own measured terms
@@ -1460,9 +1526,9 @@ static double host_read_bps() {
 //     an EXL3 pack's ^1.4, STRATA_SPLIT_COVER_B, without either - that is what Strata has to assume, its profile
 //     carries only a ranking);
 //   - a layer's time on its card: the bytes it reads (its dense weights and its VRAM experts' share of the routed
-//     ones) over the card's memory bandwidth - Strata scales a fitted per-layer time by SMs x clock; and each miss:
-//     the expert's bytes over the parts' share of the host's RAM read speed, measured here - the CPU lane computes
-//     the experts VRAM does not hold (Strata prices a fitted miss over the PCIe link);
+//     ones) over the card's memory read speed, measured here - Strata scales a fitted per-layer time by SMs x clock;
+//     and each miss: the expert's bytes over the parts' share of the host's RAM read speed, measured here too - the
+//     CPU lane computes the experts VRAM does not hold (Strata prices a fitted miss over the PCIe link);
 //   - a token: the parts' times added (Strata), the slowest part breaking a tie - except the pipelined decode of a
 //     two-part split with the draft block, where the GPUs work on consecutive tokens: there a token costs the slower
 //     part (the draft on the last one), and the sum breaks the tie;
@@ -1680,17 +1746,19 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         if (!cv.empty()) return cv[(size_t) std::min<int64_t>(s, (int64_t) cv.size() - 1)];
         return 1.0 - std::pow(1.0 - (double) s / g.n_expert, cover_b);
     };
-    // the cards: free VRAM, memory bandwidth (the bus: 2 x memory clock x width); the host's RAM read speed
+    // the cards: free VRAM, memory read speed (device_read_bps, every card at once; without it 2 x memory clock x bus
+    // width, which only CUDA's attribute gives right); the host's RAM read speed
     struct Card {
         int dev;
         double free, total, bw;
         std::string name;
+        const char* how;   // where bw came from (the log)
     };
     std::vector<Card> cards;
     int cur = 0;
     cudaGetDevice(&cur);
     for (int d : devs) {
-        Card c{d, 0, 0, 0, ""};
+        Card c{d, 0, 0, 0, "", "no reading"};
         size_t fr = 0, tot = 0;
         cudaSetDevice(d);
         if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) cudaGetLastError();
@@ -1704,9 +1772,23 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         c.free = (double) fr;
         c.total = (double) tot;
         c.bw = 2.0 * (double) khz * 1e3 * (double) bits / 8.0;
+        if (c.bw > 0) c.how = "2 x memory clock x bus width";
         cards.push_back(c);
     }
     cudaSetDevice(cur);
+    {
+        std::vector<double> rd(cards.size(), 0.0);
+        std::vector<std::thread> th;
+        th.reserve(cards.size());
+        for (size_t i = 0; i < cards.size(); ++i)
+            th.emplace_back([&rd, &cards, i] { rd[i] = device_read_bps(cards[i].dev, cards[i].free); });
+        for (auto& t : th) t.join();
+        for (size_t i = 0; i < cards.size(); ++i)
+            if (rd[i] > 0) {
+                cards[i].bw = rd[i];
+                cards[i].how = "measured read";
+            }
+    }
     for (auto& c : cards)
         if (c.bw <= 0) c.bw = 1e11;   // (no reading: every card the same, and the misses decide)
     const double host_bps = host_read_bps();
@@ -1888,8 +1970,8 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         return {};
     }
     for (const auto& c : cards)
-        std::fprintf(stderr, "glm split auto: CUDA%d (%s) memory %.0f GB/s, %.2f GB free\n", c.dev, c.name.c_str(),
-                     c.bw / 1e9, c.free / 1073741824.0);
+        std::fprintf(stderr, "glm split auto: CUDA%d (%s) memory %.0f GB/s (%s), %.2f GB free\n", c.dev,
+                     c.name.c_str(), c.bw / 1e9, c.how, c.free / 1073741824.0);
     std::fprintf(stderr, "glm split auto: the host reads RAM at %.0f GB/s (a part's CPU lane: %.0f); the routes from %s; "
                          "%s\n", host_bps / 1e9, miss_bps / 1e9,
                  cover[3].empty() ? "the default coverage curve (no usage counts)" : "the usage counts",
