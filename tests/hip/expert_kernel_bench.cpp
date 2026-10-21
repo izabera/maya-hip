@@ -299,6 +299,7 @@ int main(int argc, char** argv) {
     bool ok = run(16, 22, parity_only, shared_mode, sweep, stream);
     ok &= run(16, 18, parity_only, shared_mode, sweep, stream);
     ok &= run(21, 17, parity_only, shared_mode, sweep, stream);
+    ok &= run(22, 18, parity_only, shared_mode, sweep, stream); // iq2_s gate/up in maya-m
     if (parity_only) { ok &= run(18, 16, true, shared_mode, sweep, stream); ok &= run(22, 22, true, shared_mode, sweep, stream); }
     check(hipStreamDestroy(stream), "stream destroy");
     std::printf("hip_expert_kernel_bench: %s\n", ok ? "PASS" : "FAIL");

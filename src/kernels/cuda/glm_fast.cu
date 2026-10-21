@@ -6765,14 +6765,14 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
     MoeDev d = d_in;
     d.skip = g_skip;
 #if defined(STRATA_USE_HIP)
-    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true);
+    const bool tuned = (gu_type == 16 || gu_type == 22) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true);
     if (gu_type == 22) note_gu22(tuned, 0);
     if (tuned) {
         // Packed sign expansion, original 16-wave/four-row geometry, grid in LDS.
-        if (gu_type == 16)
+        if (gu_type == 16) // iq2_xxs
             launch_expert_gu<16, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
                 xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
-        else
+        else // iq2_s
             launch_expert_gu<22, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
                 xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
         launch_check("moe_gate_up RDNA3");
