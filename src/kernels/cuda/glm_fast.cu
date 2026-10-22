@@ -5415,9 +5415,8 @@ namespace {
 std::atomic<int> g_mv_r{-1}, g_mv_u{2}, g_mv_wpb{8}, g_mv_lds{-1};
 // the most activations the RDNA kernels take at once (mv_rdna_launch<1..8>); more go to the other kernels
 constexpr int kMaxRdnaNt = 8;
-// The device the launch runs on: by default the RDNA 3.5 APUs (gfx115x - measured on a Radeon 8065S), whose LPDDR5X
-// latency the in-flight loads hide; STRATA_GLM_MV_RDNA=1 on any gfx11 (an RX 7900's GDDR6: not measured yet),
-// STRATA_GLM_MV_RDNA=0 keeps mv_kernel_t and the generic kernel (A/B)
+// Automatic on gfx115x, gfx120x, and for single-token gfx1100 batches (measured on an RX 7900 XTX).
+// STRATA_GLM_MV_RDNA=1 enables every gfx11/gfx12, including multi-token batches; =0 keeps the original kernels.
 // Which dense GEMV kernels a device's decode runs, once per device: the engine's own record that MAYA_GLM_MV_RDNA reached
 // the dispatch - or did not
 void note_mv(int device, bool on) {
@@ -5427,25 +5426,29 @@ void note_mv(int device, bool on) {
     if (seen.fetch_or(bit) & bit) return;
     std::fprintf(stderr, "glm mv: CUDA%d dense GEMVs on the %s\n", device, on ? "RDNA3 kernel" : "original kernels");
 }
-bool mv_rdna_device() {
-    static const int mode = [] {   // -1: default (gfx115x + gfx120x), 0: off, 1: every gfx11/gfx12
+struct RdnaMvDevice { bool on = false, gfx1100 = false; };
+RdnaMvDevice mv_rdna_device(int nt) {
+    static const int mode = [] {   // -1: default, 0: off, 1: every gfx11/gfx12
         const char* v = std::getenv("STRATA_GLM_MV_RDNA");
         return v == nullptr ? -1 : v[0] == '0' ? 0 : 1;
     }();
-    if (mode == 0 || g_mv_r.load(std::memory_order_relaxed) == 0) return false;
+    if (mode == 0 || g_mv_r.load(std::memory_order_relaxed) == 0) return {};
     int device = 0;
-    if (hipGetDevice(&device) != hipSuccess) return false;
+    if (hipGetDevice(&device) != hipSuccess) return {};
     static thread_local int cached_device = -1;
     static thread_local bool on = false;
+    static thread_local bool gfx1100 = false;
     if (cached_device != device) {
         hipDeviceProp_t prop{};
-        if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
-        on = std::strncmp(prop.gcnArchName, mode > 0 ? "gfx11" : "gfx115", mode > 0 ? 5 : 6) == 0 ||
+        if (hipGetDeviceProperties(&prop, device) != hipSuccess) return {};
+        gfx1100 = std::strncmp(prop.gcnArchName, "gfx1100", 7) == 0;
+        on = (mode > 0 ? std::strncmp(prop.gcnArchName, "gfx11", 5) == 0
+                       : gfx1100 || std::strncmp(prop.gcnArchName, "gfx115", 6) == 0) ||
              std::strncmp(prop.gcnArchName, "gfx12", 5) == 0;
         cached_device = device;
         note_mv(device, on);
     }
-    return on;
+    return {on && (mode > 0 || !gfx1100 || nt == 1), gfx1100};
 }
 template<int NT, int R, int U>
 void mv_rdna_launch_w(const MvBatch& b, int blocks, int wpb, int lds, cudaStream_t s) {
@@ -5483,10 +5486,30 @@ void mv_rdna_launch(const MvBatch& b, int blocks, int r, int u, int wpb, int lds
 // The batch's Q6_K and BF16 jobs in one launch (BF16 first); marks them done.  False: not this device, or more than
 // kMaxRdnaNt activations (its kernels take 8 at most - the rest go to the other kernels).
 bool mv_rdna(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t s) {
-    if (nt > kMaxRdnaNt || !mv_rdna_device()) return false;
+    if (nt > kMaxRdnaNt) return false;
+    const auto device = mv_rdna_device(nt);
+    if (!device.on) return false;
     int r = g_mv_r.load(std::memory_order_relaxed), u = g_mv_u.load(std::memory_order_relaxed);
-    const int wpb = g_mv_wpb.load(std::memory_order_relaxed) == 4 ? 4 : 8;
-    if (r < 0) { r = 1; u = 2; }
+    int wpb = g_mv_wpb.load(std::memory_order_relaxed) == 4 ? 4 : 8;
+    int lds_mode = g_mv_lds.load(std::memory_order_relaxed);
+    if (r < 0) {
+        r = 1; u = 2;
+        if (device.gfx1100 && nt == 1) {
+            // Only the measured batch signatures: extra prediction routers and other shapes use the fallback.
+            // RX 7900 XTX: dense gate/up 103.7 -> 96.5 us; router/shared experts 22.5 -> 21.5 us.
+            const auto count = [&](int type, int in, int out) {
+                int matches = 0;
+                for (int i = 0; i < n; ++i)
+                    matches += jobs[i].type == type && jobs[i].n_in == in && jobs[i].n_out == out;
+                return matches;
+            };
+            if (n == 2 && count(14, 4096, 12288) == 2) {
+                u = 4; wpb = 8; lds_mode = 1;
+            } else if (n == 3 && count(14, 4096, 2048) == 2 && count(kTypeBF16, 4096, 288) == 1) {
+                r = 2; u = 4; wpb = 4; lds_mode = 0;
+            }
+        }
+    }
     if (nt > 1 && r > 2) r = 2;
     MvBatch b{};
     int acc = 0, m = 0, max_in = 0;
@@ -5501,7 +5524,6 @@ bool mv_rdna(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t s) {
             }
     if (m == 0) return true;
     b.n = m;
-    const int lds_mode = g_mv_lds.load(std::memory_order_relaxed);
     const bool use_lds = lds_mode > 0 || (lds_mode < 0 && nt == 1 && max_in <= 4096);
     int lds = use_lds ? nt * (max_in / 32) * (int) sizeof(block_q8_1) : 0;
     if (lds > 48 * 1024) lds = 0;
@@ -5611,7 +5633,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     for (int i = 0; i < n; ++i) one_col = one_col && jobs[i].ncol == 1;
     if (typed && one_col) {
         mv_rdna(jobs, n, 1, done, s);
-    } else if (typed && mv_rdna_device()) {
+    } else if (typed && mv_rdna_device(2).on) {
         // a verify window's several-column jobs whose columns sit one after another (mv_nt's layout): the RDNA3 kernel
         // takes them as NT activations, each column bit for bit its one-column result - the token path's on the APUs
         // (the MTP decode's window on the Strix / Gorgon Halo).  The rest go to the tiled kernels below.
