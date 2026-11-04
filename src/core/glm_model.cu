@@ -1457,68 +1457,45 @@ static double host_read_bps() {
     return sink.load() == 1 ? best + 1.0 : best;   // (the sum keeps the reads)
 }
 
-// one pass of device_read_bps: the buffer read end to end, each thread over its grid-stride share with four 16-byte
-// loads in flight; the sum only decides a store that never comes (the buffer is zeros), so the loads stay
+// one pass of device_read_bps: the buffer read end to end in 16-byte loads; the sum only decides a store that never
+// comes (the buffer is zeros), so the loads stay
 static __global__ void device_read_pass(const uint4* __restrict__ p, size_t n, unsigned* __restrict__ sink) {
-    const size_t stride = (size_t) gridDim.x * blockDim.x;
-    size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     unsigned acc = 0;
-    for (; i + 3 * stride < n; i += 4 * stride) {
-        const uint4 a = p[i], b = p[i + stride], c = p[i + 2 * stride], d = p[i + 3 * stride];
-        acc ^= (a.x ^ a.y ^ a.z ^ a.w) ^ (b.x ^ b.y ^ b.z ^ b.w) ^ (c.x ^ c.y ^ c.z ^ c.w) ^ (d.x ^ d.y ^ d.z ^ d.w);
-    }
-    for (; i < n; i += stride) {
-        const uint4 a = p[i];
-        acc ^= a.x ^ a.y ^ a.z ^ a.w;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const uint4 v = p[i];
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
     }
     if (acc == 0x9e3779b9u) *sink = acc;
 }
 
-// a card's memory read speed (bytes/s), measured as the host's is: a 1 GiB buffer (past every card's last-level cache;
-// a quarter of the free VRAM at most) read end to end for ~0.4 s, the fastest pass taken (the first ones run while the
-// memory clock ramps up from idle); 0 when it cannot be measured.  The clock attributes do not give it portably:
-// CUDA's memory clock is half the data rate a pin (so 2 x clock x bus width), HIP's is the clock the driver runs -
-// 1/16 of the data rate on a GDDR6 Radeon (an RX 7900 XTX reads 1250 MHz for its 20 Gbps: 120 GB/s of its 960), but
-// not on HBM parts
+// a card's memory read speed (bytes/s), measured as the host's is: up to 1 GiB (past the last-level cache, a quarter
+// of the free VRAM at most) read for ~0.4 s, the fastest pass taken (the first ones run while the memory clock ramps
+// up); 0 when it cannot be measured.  The clock attributes do not give it portably: HIP's memory clock on a GDDR6
+// Radeon is 1/16 of the data rate (an RX 7900 XTX would read 120 GB/s of its 960)
 static double device_read_bps(int dev, double free_bytes) {
     const size_t bytes = std::min<size_t>((size_t) 1 << 30, (size_t) (free_bytes / 4.0)) & ~(((size_t) 1 << 20) - 1);
-    if (bytes < ((size_t) 256 << 20) || cudaSetDevice(dev) != cudaSuccess) {
-        (void) cudaGetLastError();
-        return 0.0;
-    }
     int sms = 0;
-    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || sms <= 0) sms = 64;
     void* buf = nullptr;
-    unsigned* sink = nullptr;
-    cudaStream_t s = nullptr;
     cudaEvent_t e0 = nullptr, e1 = nullptr;
     double best = 0.0;
-    if (cudaMalloc(&buf, bytes) == cudaSuccess && cudaMalloc((void**) &sink, sizeof(unsigned)) == cudaSuccess &&
-        cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess && cudaEventCreate(&e0) == cudaSuccess &&
-        cudaEventCreate(&e1) == cudaSuccess && cudaMemsetAsync(buf, 0, bytes, s) == cudaSuccess) {
-        const auto t0 = std::chrono::steady_clock::now();
-        for (int rep = 0; rep < 2000; ++rep) {
-            float ms = 0.0f;
-            bool ok = cudaEventRecord(e0, s) == cudaSuccess;
-            device_read_pass<<<sms * 8, 256, 0, s>>>((const uint4*) buf, bytes / sizeof(uint4), sink);
-            ok = ok && cudaGetLastError() == cudaSuccess && cudaEventRecord(e1, s) == cudaSuccess &&
-                 cudaEventSynchronize(e1) == cudaSuccess && cudaEventElapsedTime(&ms, e0, e1) == cudaSuccess;
-            if (!ok) {
-                best = 0.0;
-                break;
-            }
-            if (ms > 0.0f) best = std::max(best, (double) bytes / (1e-3 * (double) ms));
-            if (rep >= 8 && std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(400)) break;
-        }
+    bool ok = bytes >= ((size_t) 256 << 20) && cudaSetDevice(dev) == cudaSuccess &&
+              cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess &&
+              cudaMalloc(&buf, bytes + sizeof(uint4)) == cudaSuccess && cudaMemset(buf, 0, bytes) == cudaSuccess &&
+              cudaEventCreate(&e0) == cudaSuccess && cudaEventCreate(&e1) == cudaSuccess;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int rep = 0; ok && (rep < 8 || std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(400)); ++rep) {
+        float ms = 0.0f;
+        cudaEventRecord(e0);
+        device_read_pass<<<std::max(sms, 1) * 8, 256>>>((const uint4*) buf, bytes / sizeof(uint4),
+                                                         (unsigned*) ((char*) buf + bytes));
+        ok = cudaGetLastError() == cudaSuccess && cudaEventRecord(e1) == cudaSuccess &&
+             cudaEventSynchronize(e1) == cudaSuccess && cudaEventElapsedTime(&ms, e0, e1) == cudaSuccess;
+        if (ok && ms > 0.0f) best = std::max(best, (double) bytes / (1e-3 * (double) ms));
     }
-    if (s != nullptr) {
-        (void) cudaStreamSynchronize(s);
-        (void) cudaStreamDestroy(s);
-    }
-    if (e0 != nullptr) (void) cudaEventDestroy(e0);
-    if (e1 != nullptr) (void) cudaEventDestroy(e1);
-    if (sink != nullptr) (void) cudaFree(sink);
-    if (buf != nullptr) (void) cudaFree(buf);
+    if (!ok) best = 0.0;
+    if (e0 != nullptr) cudaEventDestroy(e0);
+    if (e1 != nullptr) cudaEventDestroy(e1);
+    if (buf != nullptr) cudaFree(buf);
     (void) cudaGetLastError();
     return best < 1e14 ? best : 0.0;   // (a pass that never ran reads as an impossible speed)
 }
